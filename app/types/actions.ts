@@ -28,11 +28,12 @@ export type BoltAction = FileAction | ShellAction | StartAction | BuildAction;
 export type BoltActionData = BoltAction | BaseAction;
 
 export interface ActionAlert {
-  type: string;
+  type?: string;
   title: string;
-  description: string;
-  content: string;
-  source?: 'terminal' | 'preview'; // Add source to differentiate between terminal and preview errors
+  message?: string;
+  description?: string;
+  content?: string;
+  source?: 'terminal' | 'preview' | 'api'; // Added 'api' as a valid source for API-related alerts
 }
 
 export interface FileHistory {

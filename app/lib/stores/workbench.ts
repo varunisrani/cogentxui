@@ -53,6 +53,10 @@ export class WorkbenchStore {
   modifiedFiles = new Set<string>();
   artifactIdList: string[] = [];
   #globalExecutionQueue = Promise.resolve();
+
+  // Debug messages storage for API responses
+  debugMessages: WritableAtom<any[]> = atom([]);
+
   constructor() {
     if (import.meta.hot) {
       import.meta.hot.data.artifacts = this.artifacts;
@@ -545,6 +549,24 @@ export class WorkbenchStore {
     } catch (error) {
       console.error('Error pushing to GitHub:', error);
       throw error; // Rethrow the error for further handling
+    }
+  }
+
+  // Add debug message to display API information
+  addDebugMessage(message: { type: string; content: string; timestamp: string }) {
+    const currentMessages = this.debugMessages.get();
+    this.debugMessages.set([...currentMessages, message]);
+    
+    // Log to console for immediate visibility during development
+    console.log(`[DEBUG] ${message.type}:`, message.content);
+    
+    // Also set as alert for visibility in UI when needed
+    if (message.type === 'api-error') {
+      this.actionAlert.set({
+        source: 'api',
+        title: 'API Connection Issue',
+        message: message.content,
+      });
     }
   }
 }

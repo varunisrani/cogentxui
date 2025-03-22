@@ -1,0 +1,12 @@
+fastapi
+uvicorn
+websockets
+pydantic
+python-dotenv
+logfire
+httpx
+supabase
+openai
+langgraph
+pydantic-ai
+pip

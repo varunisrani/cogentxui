@@ -1,0 +1,98 @@
+# Understanding and Fixing the JSON Decode Error
+
+It looks like you're encountering a JSON decode error in your Archon application. The error occurs because the CEO Agent is returning a plain text response, but the code is trying to parse it as JSON.
+
+## The Problem
+
+The error message shows:
+```
+JSONDecodeError: Expecting value: line 1 column 1 (char 0)
+```
+
+This happens because the CEO Agent returns a friendly greeting:
+```
+Hello! I'm here to help you create AI agents and crews. Feel free to share your ideas or needs, and I'll assist you in bringing them to life! What do you have in mind?
+```
+
+But the code is trying to parse this text as JSON with `json.loads(json_string)`.
+
+## Solutions
+
+Here are a few ways to fix this issue:
+
+### 1. Modify the CEO Agent to Return JSON
+
+If you control the CEO Agent implementation, you can modify it to return properly formatted JSON:
+
+```python:archon/pydantic_ai_coder.py
+# ... existing code ...
+def process(self, prompt):
+    # ... existing code ...
+    # Instead of returning plain text
+    return json.dumps({"message": "Hello! I'm here to help you create AI agents and crews. Feel free to share your ideas or needs, and I'll assist you in bringing them to life! What do you have in mind?"})
+# ... existing code ...
+```
+
+### 2. Modify the Parsing Logic
+
+If you can't modify the CEO Agent, you can update the parsing logic to handle both JSON and plain text:
+
+```python:archon/archon_graph.py
+# ... existing code ...
+def ceo_run_with_logging(self, prompt):
+    # ... existing code ...
+    try:
+        parsed_output = json.loads(json_string)
+    except json.JSONDecodeError:
+        # Handle plain text by converting it to a simple JSON structure
+        parsed_output = {"message": json_string}
+    # ... existing code ...
+```
+
+### 3. Use a Geolocation Hook
+
+Based on your search query and the search results, it seems you might be looking for a geolocation hook for React. If that's the case, you can use the `use-geolocation-position` package from GitHub:
+
+```javascript
+import { useGeolocationPosition } from 'use-geolocation-position';
+
+function MyComponent() {
+  const { 
+    position, 
+    error, 
+    loading 
+  } = useGeolocationPosition();
+
+  if (loading) return <div>Loading position...</div>;
+  if (error) return <div>Error: {error.message}</div>;
+  
+  return (
+    <div>
+      <h2>Your Location</h2>
+      {position && (
+        <div>
+          <p>Latitude: {position.coords.latitude}</p>
+          <p>Longitude: {position.coords.longitude}</p>
+          <p>Accuracy: {position.coords.accuracy} meters</p>
+        </div>
+      )}
+    </div>
+  );
+}
+```
+
+You can install it with:
+
+```bash
+npm install use-geolocation-position
+# or
+yarn add use-geolocation-position
+```
+
+This hook provides a clean way to access the browser's Geolocation API in React applications.
+
+## References
+
+- [use-geolocation-position on GitHub](https://github.com/tiaanduplessis/use-geolocation-position)
+- [useHooks collection](https://usehooks.com/usegeolocation)
+ do this

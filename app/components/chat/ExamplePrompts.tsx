@@ -1,11 +1,11 @@
 import React from 'react';
 
 const EXAMPLE_PROMPTS = [
-  { text: 'Build a todo app in React using Tailwind' },
-  { text: 'Build a simple blog using Astro' },
-  { text: 'Create a cookie consent form using Material UI' },
-  { text: 'Make a space invaders game' },
-  { text: 'Make a Tic Tac Toe game in html, css and js only' },
+  { text: 'Create a customer support AI agent that can answer product questions' },
+  { text: 'Build an AI assistant that can schedule appointments and send reminders' },
+  { text: 'Make an agent that can analyze and summarize financial reports' },
+  { text: 'Create a content creation assistant that writes social media posts' },
+  { text: 'Build an AI agent for real-time language translation in meetings' },
 ];
 
 export function ExamplePrompts(sendMessage?: { (event: React.UIEvent, messageInput?: string): void | undefined }) {

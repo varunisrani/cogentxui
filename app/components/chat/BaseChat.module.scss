@@ -45,3 +45,46 @@
   fill: url(#shine-gradient);
   mix-blend-mode: overlay;
 }
+
+// Add new styles for formatted AI content
+:global {
+  .formatted-ai-content {
+    text-align: left;
+    line-height: 1.5;
+    
+    h1 {
+      font-size: 1.5rem;
+      font-weight: bold;
+      margin-top: 1rem;
+      margin-bottom: 0.5rem;
+    }
+    
+    h2 {
+      font-size: 1.25rem;
+      font-weight: bold;
+      margin-top: 0.75rem;
+      margin-bottom: 0.5rem;
+    }
+    
+    h3 {
+      font-size: 1.1rem;
+      font-weight: bold;
+      margin-top: 0.5rem;
+      margin-bottom: 0.5rem;
+    }
+    
+    p {
+      margin-bottom: 0.75rem;
+    }
+    
+    .list-item {
+      display: flex;
+      margin-bottom: 0.25rem;
+    }
+    
+    .list-number {
+      font-weight: bold;
+      margin-right: 0.5rem;
+    }
+  }
+}

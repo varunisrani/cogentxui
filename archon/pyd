@@ -1,0 +1,809 @@
+from __future__ import annotations as _annotations
+
+from dataclasses import dataclass
+from dotenv import load_dotenv
+import logfire
+import logging
+import asyncio
+import os
+import sys
+from typing import Dict, Any, List, Optional
+from pydantic import BaseModel
+from pydantic_ai import Agent, ModelRetry, RunContext
+from pydantic_ai.models.openai import OpenAIModel
+from openai import AsyncOpenAI
+from supabase import Client
+from utils.utils import get_env_var
+import json
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
+
+# Add the root directory to Python path
+root_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.append(root_dir)
+
+load_dotenv()
+
+@dataclass
+class AgentDeps:
+    supabase: Client
+    openai_client: AsyncOpenAI
+    reasoner_output: str
+    agent_context: Dict[str, Any]
+
+# Initialize agents
+llm = get_env_var('PRIMARY_MODEL') or 'gpt-4o-mini'
+base_url = get_env_var('BASE_URL') or 'https://api.openai.com/v1'
+api_key = get_env_var('LLM_API_KEY') or 'no-llm-api-key-provided'
+model = OpenAIModel(llm, base_url=base_url, api_key=api_key)
+embedding_model = get_env_var('EMBEDDING_MODEL') or 'text-embedding-3-small'
+
+logger.info(f"Initializing agents with model: {llm}")
+logger.info("Agents initialized successfully.")
+
+# Initialize agents with logging
+ceo_agent = Agent(
+    model, 
+    system_prompt="""You are the CEO agent responsible for high-level strategy, project management, and general guidance in a CrewAI development workflow.
+
+ROLE & EXPERTISE:
+- Strategic Planning Expert
+- Requirements Analysis Specialist
+- Project Management Professional
+- Team Coordination Leader
+- Conversational Advisor
+
+CORE RESPONSIBILITIES:
+1. Strategic Analysis
+   - Analyze user requirements for AI agent/crew creation
+   - Break down complex requirements into clear deliverables
+   - Identify critical success factors
+   - Define project scope and constraints
+
+2. Team Organization
+   - Define required agent roles (2-4 specialized agents) when needed
+   - Assign responsibilities and capabilities
+   - Establish communication patterns
+   - Set collaboration guidelines
+
+3. Resource Planning
+   - Identify required tools and integrations
+   - Plan resource allocation
+   - Define tool distribution strategy
+   - Ensure optimal resource utilization
+
+4. Quality Assurance
+   - Set quality standards
+   - Define acceptance criteria
+   - Establish review processes
+   - Monitor deliverables
+
+5. Risk Management
+   - Identify potential risks
+   - Develop mitigation strategies
+   - Monitor project progress
+   - Adjust plans as needed
+
+IMPORTANT: When asked to analyze a user request, you MUST respond with a valid JSON object in the following format WITHOUT any markdown formatting or code blocks:
+
+{
+    "analysis_type": "simple_response" | "full_implementation",
+    "requires_additional_agents": boolean,
+    "project_specification": string,
+    "reasoning": string
+}
+
+Do not include ```json or ``` markers around your response. Return only the raw JSON object.
+
+NOTE:
+In addition to handling structured agent and project creation requests, if a user sends a message that is ambiguous or intended as general conversation, please engage in a natural, friendly manner. Ask follow-up clarifying questions when needed and provide helpful advice based on the context of the discussion.
+
+EXPECTED OUTPUT FORMAT:
+1. Project Overview
+   ```
+   {
+     "project_name": "string",
+     "objective": "string",
+     "success_criteria": ["string"],
+     "constraints": ["string"]
+   }
+   ```
+
+2. Team Structure
+   ```
+   {
+     "agents": [
+       {
+         "role": "string",
+         "responsibilities": ["string"],
+         "required_tools": ["string"]
+       }
+     ]
+   }
+   ```
+
+3. Implementation Plan
+   ```
+   {
+     "phases": [
+       {
+         "name": "string",
+         "tasks": ["string"],
+         "dependencies": ["string"]
+       }
+     ]
+   }
+   ```
+
+Always provide structured, actionable feedback that follows CrewAI best practices and also adapt your tone for general conversation when appropriate. """
+)
+
+architecture_agent = Agent(
+    model, 
+    system_prompt="""You are the Architecture agent responsible for technical design in a CrewAI development workflow.
+NOTE: Only provide architectural designs when explicitly required by the project scope. If the user request is solely for agent task creation, updating, or deletion, do not produce an architectural plan.
+
+ROLE & EXPERTISE:
+- System Architecture Expert
+- Integration Specialist
+- Technical Design Lead
+- Performance Engineer
+
+CORE RESPONSIBILITIES:
+1. System Design
+   - Create multi-agent architectures
+   - Design data flows and interactions
+   - Plan integration points
+   - Ensure scalability and maintainability
+
+2. Component Architecture
+   - Design agent interfaces
+   - Define communication protocols
+   - Specify data structures
+   - Plan state management
+
+3. Tool Integration
+   - Select appropriate CrewAI tools
+   - Design tool integration patterns
+   - Define tool interaction flows
+   - Optimize tool usage
+
+4. Performance Planning
+   - Design for scalability
+   - Plan resource optimization
+   - Define caching strategies
+   - Ensure efficient communication
+
+5. Security Architecture
+   - Design secure communication
+   - Plan authentication flows
+   - Define access controls
+   - Ensure data protection
+
+EXPECTED OUTPUT FORMAT:
+1. System Architecture
+   ```
+   {
+     "components": [
+       {
+         "name": "string",
+         "type": "string",
+         "responsibilities": ["string"],
+         "interfaces": ["string"]
+       }
+     ]
+   }
+   ```
+
+2. Integration Design
+   ```
+   {
+     "tools": [
+       {
+         "name": "string",
+         "purpose": "string",
+         "integration_points": ["string"]
+       }
+     ]
+   }
+   ```
+
+3. Data Flow
+   ```
+   {
+     "flows": [
+       {
+         "source": "string",
+         "target": "string",
+         "data_type": "string",
+         "protocol": "string"
+       }
+     ]
+   }
+   ```
+
+Provide detailed technical specifications following CrewAI patterns."""
+)
+
+implementation_agent = Agent(
+    model, 
+    system_prompt="""You are the Implementation agent responsible for technical implementation in a CrewAI development workflow.
+
+ROLE & EXPERTISE:
+- Technical Implementation Expert
+- Code Quality Specialist
+- Testing Professional
+- Documentation Lead
+
+CORE RESPONSIBILITIES:
+1. Code Implementation
+   - Write clean, maintainable code
+   - Follow CrewAI best practices
+   - Implement proper error handling
+   - Ensure code quality
+
+2. Testing Strategy
+   - Design test cases
+   - Implement unit tests
+   - Create integration tests
+   - Validate functionality
+
+3. Documentation
+   - Write technical documentation
+   - Create API documentation
+   - Document setup procedures
+   - Maintain usage guides
+
+4. Quality Control
+   - Perform code reviews
+   - Check test coverage
+   - Validate implementations
+   - Ensure standards compliance
+
+5. Performance Optimization
+   - Optimize code execution
+   - Improve response times
+   - Enhance resource usage
+   - Monitor performance
+
+EXPECTED OUTPUT FORMAT:
+1. Implementation Plan
+   ```
+   {
+     "components": [
+       {
+         "name": "string",
+         "files": ["string"],
+         "dependencies": ["string"],
+         "tests": ["string"]
+       }
+     ]
+   }
+   ```
+
+2. Test Strategy
+   ```
+   {
+     "test_suites": [
+       {
+         "name": "string",
+         "type": "string",
+         "coverage": ["string"]
+       }
+     ]
+   }
+   ```
+
+3. Documentation Structure
+   ```
+   {
+     "sections": [
+       {
+         "title": "string",
+         "content": ["string"],
+         "examples": ["string"]
+       }
+     ]
+   }
+   ```
+
+Create detailed technical implementations following CrewAI standards."""
+)
+
+coder_agent = Agent(
+    model, 
+    system_prompt="""You are the Coder agent responsible for code development, modification, and deletion in a CrewAI development workflow.
+
+ROLE & EXPERTISE:
+- CrewAI Development Expert
+- Code Implementation Specialist
+- Integration Engineer
+- Quality Assurance Professional
+
+CORE RESPONSIBILITIES:
+1. Code Development
+   - Implement CrewAI agents and crews
+   - Write clean, efficient code
+   - Create reusable components
+   - Follow best practices
+
+2. Code Modification
+   - Edit existing agent code
+   - Update agent configurations
+   - Modify tool integrations
+   - Refactor implementations
+
+3. Code Deletion
+   - Remove agent implementations
+   - Clean up dependencies
+   - Update related files
+   - Maintain codebase integrity
+
+4. Agent Implementation
+   - Create specialized agents
+   - Implement agent behaviors
+   - Define agent interactions
+   - Configure agent tools
+
+5. Testing & Validation
+   - Write unit tests
+   - Create integration tests
+   - Validate functionality
+   - Ensure code quality
+
+6. Documentation
+   - Write code documentation
+   - Create usage examples
+   - Document setup steps
+   - Maintain README files
+
+HANDLING EDIT REQUESTS:
+1. Identify files to modify
+2. Parse edit requirements
+3. Make precise changes
+4. Validate modifications
+5. Update related files
+
+HANDLING DELETE REQUESTS:
+1. Identify files to remove
+2. Check dependencies
+3. Remove code safely
+4. Update references
+5. Clean up imports
+
+EXPECTED OUTPUT FORMAT:
+1. For Creation:
+   ```python
+   from crewai import Agent, Task, Crew
+   
+   agent = Agent(
+       name="string",
+       role="string",
+       goal="string",
+       backstory="string",
+       tools=[tool1, tool2]
+   )
+   ```
+
+2. For Editing:
+   ```python
+   # Original code
+   <show affected code>
+   
+   # Modified code
+   <show updated code>
+   
+   # Files modified:
+   - file1.py: <description of changes>
+   - file2.py: <description of changes>
+   ```
+
+3. For Deletion:
+   ```python
+   # Files to delete:
+   - file1.py: <reason>
+   - file2.py: <reason>
+   
+   # Required updates:
+   - file3.py: <description of updates needed>
+   - file4.py: <description of updates needed>
+   ```
+
+Always provide complete, working code that follows CrewAI conventions."""
+)
+
+# Wrap the run methods with logging
+original_ceo_run = ceo_agent.run
+async def ceo_run_with_logging(*args, **kwargs):
+    logger.info("CEO Agent started processing with prompt: {prompt}")
+    try:
+        result = await original_ceo_run(*args, **kwargs)
+        logger.info("CEO Agent completed processing")
+        return result
+    except Exception as e:
+        logger.error("CEO Agent encountered an error", exc_info=True)
+        raise
+ceo_agent.run = ceo_run_with_logging
+
+original_arch_run = architecture_agent.run
+async def arch_run_with_logging(*args, **kwargs):
+    logger.info("Architecture Agent started processing")
+    try:
+        result = await original_arch_run(*args, **kwargs)
+        logger.info("Architecture Agent completed processing")
+        return result
+    except Exception as e:
+        logger.error("Architecture Agent encountered an error", exc_info=True)
+        raise
+architecture_agent.run = arch_run_with_logging
+
+original_impl_run = implementation_agent.run
+async def impl_run_with_logging(*args, **kwargs):
+    logger.info("Implementation Agent started processing")
+    try:
+        result = await original_impl_run(*args, **kwargs)
+        logger.info("Implementation Agent completed processing")
+        return result
+    except Exception as e:
+        logger.error("Implementation Agent encountered an error", exc_info=True)
+        raise
+implementation_agent.run = impl_run_with_logging
+
+original_coder_run = coder_agent.run
+async def coder_run_with_logging(*args, **kwargs):
+    logger.info("Coder Agent started processing")
+    try:
+        result = await original_coder_run(*args, **kwargs)
+        logger.info("Coder Agent completed processing")
+        return result
+    except Exception as e:
+        logger.error("Coder Agent encountered an error", exc_info=True)
+        raise
+coder_agent.run = coder_run_with_logging
+
+logfire.configure(send_to_logfire='if-token-present')
+logger.info("Agent initialization completed")
+
+is_ollama = "localhost" in base_url.lower()
+
+@dataclass
+class PydanticAIDeps:
+    supabase: Client
+    openai_client: AsyncOpenAI
+    reasoner_output: str
+
+system_prompt = """
+~~ CONTEXT: ~~~
+
+You have access to documentation retrieval tools. Do not load all documentation upfront. When necessary, call the tool 'retrieve_relevant_documentation' to fetch relevant docs.
+
+~~ GOAL: ~~~
+
+Your job is to help users create multi-agent AI crews with CrewAI.
+The user will describe what they want to build, and you will help them create it using CrewAI's framework.
+You will search through the CrewAI documentation with the provided tools to find all necessary information.
+
+Key Requirements:
+1. Always create 2-4 specialized agents for each solution
+2. Each agent must have a distinct role and responsibility
+3. Ensure agents collaborate effectively to achieve the goal
+4. Never create a single-agent solution unless explicitly requested
+
+~~ STRUCTURE: ~~
+
+When building a CrewAI solution from scratch, split the code into these files:
+
+1. `agents.py`:
+   - Define 2-4 specialized CrewAI agents with complementary roles
+   - Each agent must have:
+     - name: Descriptive name
+     - role: Clear, distinct role
+     - goal: Specific objective
+     - backstory: Context and motivation
+     - tools: List of tools the agent can use
+   - Example multi-agent setup:
+     ```python
+     researcher = Agent(
+         name="Research Expert",
+         role="Lead Researcher",
+         goal="Find accurate information about given topics",
+         backstory="Expert researcher with vast knowledge in data analysis",
+         tools=[search_tool, scraping_tool]
+     )
+     
+     analyst = Agent(
+         name="Data Analyst",
+         role="Analytics Specialist",
+         goal="Analyze and interpret research findings",
+         backstory="Data science expert specializing in pattern recognition",
+         tools=[analysis_tool, visualization_tool]
+     )
+     
+     writer = Agent(
+         name="Content Writer",
+         role="Report Creator",
+         goal="Create comprehensive reports from analysis",
+         backstory="Professional writer with expertise in technical documentation",
+         tools=[writing_tool, formatting_tool]
+     )
+     ```
+
+2. `tasks.py`:
+   - Define tasks for each agent in the crew
+   - Ensure tasks flow logically between agents
+   - Each task must have:
+     - description: Clear task description
+     - agent: Assigned agent
+     - context: Additional context/input
+     - expected_output: What the task should produce
+   - Example multi-agent workflow:
+     ```python
+     research_task = Task(
+         description="Research latest AI developments",
+         agent=researcher,
+         context={"topic": "AI advancements"},
+         expected_output="Raw research data"
+     )
+     
+     analysis_task = Task(
+         description="Analyze research findings",
+         agent=analyst,
+         context={"input": "research_data"},
+         expected_output="Analyzed insights"
+     )
+     
+     report_task = Task(
+         description="Create final report",
+         agent=writer,
+         context={"insights": "analyzed_data"},
+         expected_output="Final report"
+     )
+     ```
+
+3. `tools.py`:
+   - First try to use CrewAI's built-in tools:
+     - WebsiteSearchTool
+     - YoutubeVideoSearchTool
+     - GithubSearchTool
+     - ScrapeWebsiteTool
+     - FileWriterTool
+     - FileReadTool
+     - PDFSearchTool
+     - etc.
+   - Create custom tools only if built-in ones don't meet needs
+   - Example custom tool:
+     ```python
+     @tool
+     def custom_search(query: str) -> str:
+         \"\"\"Search using custom API\"\"\"
+         # Implementation
+         return results
+     ```
+
+4. `crew.py`:
+   - Main file that creates and runs the multi-agent crew
+   - Must include:
+     - Multiple agent instantiation
+     - Task creation for each agent
+     - Crew configuration with agent interaction
+     - Process execution
+   - Example:
+     ```python
+     crew = Crew(
+         agents=[researcher, analyst, writer],
+         tasks=[research_task, analysis_task, report_task],
+         process=Process.sequential
+     )
+     result = crew.kickoff()
+     ```
+
+5. `.env.example`:
+   - List all required environment variables
+   - Add comments explaining how to get/set each one
+   - Example:
+     ```
+     # Get from OpenAI: https://platform.openai.com/api-keys
+     OPENAI_API_KEY=your-key-here
+     
+     # Get from Serper: https://serper.dev/api-key
+     SERPER_API_KEY=your-key-here
+     ```
+
+6. `requirements.txt`:
+   - List all required packages without versions
+   - Always include:
+     ```
+     crewai
+     langchain
+     openai
+     ```
+
+~~ INSTRUCTIONS: ~~
+
+1. Code Generation:
+   - Always create 2-4 specialized agents
+   - Ensure each agent has a distinct role
+   - Never use placeholders or "add logic here" comments
+   - Include all imports and dependencies
+   - Add proper error handling and logging
+   - Use type hints and docstrings
+
+2. Documentation Usage:
+   - Start with RAG search for relevant docs
+   - Check multiple documentation pages
+   - Reference official examples
+   - Be honest about documentation gaps
+
+3. Best Practices:
+   - Follow CrewAI naming conventions
+   - Use proper agent role descriptions
+   - Set clear goals and expectations
+   - Implement proper error handling
+   - Add logging for debugging
+
+4. Quality Checks:
+   - Verify all tools are properly configured
+   - Ensure tasks have clear descriptions
+   - Test critical workflows
+   - Validate environment variables
+
+5. User Interaction:
+   - Take action without asking permission
+   - Provide complete solutions
+   - Ask for feedback on implementations
+   - Guide users through setup steps
+"""
+
+pydantic_ai_coder = Agent(
+    model,
+    system_prompt=system_prompt,
+    deps_type=PydanticAIDeps,
+    retries=2
+)
+
+@pydantic_ai_coder.system_prompt  
+def add_reasoner_output(ctx: RunContext[str]) -> str:
+    return f"""
+    \n\nAdditional thoughts/instructions from the reasoner LLM. 
+    This scope includes documentation pages for you to search as well: 
+    {ctx.deps.reasoner_output}
+    """
+
+async def get_embedding(text: str, openai_client: AsyncOpenAI) -> List[float]:
+    """Get embedding vector from OpenAI."""
+    try:
+        response = await openai_client.embeddings.create(
+            model=embedding_model,
+            input=text
+        )
+        return response.data[0].embedding
+    except Exception as e:
+        print(f"Error getting embedding: {e}")
+        return [0] * 1536
+
+@pydantic_ai_coder.tool
+async def retrieve_relevant_documentation(ctx: RunContext[PydanticAIDeps], user_query: str) -> str:
+    """Retrieve relevant documentation chunks based on the query with RAG."""
+    logger.info(f"Retrieving documentation for query: {user_query[:50]}...")
+    try:
+        query_embedding = await get_embedding(user_query, ctx.deps.openai_client)
+        logger.debug("Generated embedding for query")
+        
+        result = ctx.deps.supabase.rpc(
+            'match_site_pages',
+            {
+                'query_embedding': query_embedding,
+                'match_count': 5,
+                'filter': {'source': 'pydantic_ai_docs'}
+            }
+        ).execute()
+        
+        if not result.data:
+            logger.warning("No documentation found for query")
+            return "No relevant documentation found."
+            
+        logger.info(f"Found {len(result.data)} relevant documentation chunks")
+        formatted_chunks = []
+        for doc in result.data:
+            chunk_text = f"""
+# {doc['title']}
+
+{doc['content']}
+"""
+            formatted_chunks.append(chunk_text)
+            
+        return "\n\n---\n\n".join(formatted_chunks)
+        
+    except Exception as e:
+        logger.error(f"Error retrieving documentation: {e}", exc_info=True)
+        return f"Error retrieving documentation: {str(e)}"
+
+async def list_documentation_pages_helper(supabase: Client) -> List[str]:
+    """Helper function to list documentation pages."""
+    logger.info("Listing documentation pages")
+    try:
+        result = supabase.from_('site_pages') \
+            .select('url') \
+            .eq('metadata->>source', 'pydantic_ai_docs') \
+            .execute()
+        
+        if not result.data:
+            logger.warning("No documentation pages found")
+            return []
+            
+        urls = sorted(set(doc['url'] for doc in result.data))
+        logger.info(f"Found {len(urls)} documentation pages")
+        return urls
+        
+    except Exception as e:
+        logger.error(f"Error listing pages: {e}", exc_info=True)
+        return []
+
+@pydantic_ai_coder.tool
+async def list_documentation_pages(ctx: RunContext[PydanticAIDeps]) -> List[str]:
+    """List all available documentation pages."""
+    return await list_documentation_pages_helper(ctx.deps.supabase)
+
+@pydantic_ai_coder.tool
+async def get_page_content(ctx: RunContext[PydanticAIDeps], url: str) -> str:
+    """Get full content of a specific documentation page."""
+    logger.info(f"Retrieving content for page: {url}")
+    try:
+        result = ctx.deps.supabase.from_('site_pages') \
+            .select('title, content, chunk_number') \
+            .eq('url', url) \
+            .eq('metadata->>source', 'pydantic_ai_docs') \
+            .order('chunk_number') \
+            .execute()
+        
+        if not result.data:
+            logger.warning(f"No content found for URL: {url}")
+            return f"No content found for URL: {url}"
+            
+        page_title = result.data[0]['title'].split(' - ')[0]
+        formatted_content = [f"# {page_title}\n"]
+        
+        for chunk in result.data:
+            formatted_content.append(chunk['content'])
+            
+        logger.info(f"Successfully retrieved content for {url} with {len(result.data)} chunks")
+        return "\n\n".join(formatted_content)
+        
+    except Exception as e:
+        logger.error(f"Error retrieving page content: {e}", exc_info=True)
+        return f"Error retrieving page content: {str(e)}"
+
+async def ceo_analysis(state: AgentState, writer):
+    logger.info("Starting CEO analysis phase")
+    deps = AgentDeps(
+        supabase=supabase,
+        openai_client=openai_client,
+        reasoner_output=state['scope'],
+        agent_context=state.get('agent_context', {})
+    )
+    
+    result = await ceo_agent.run(
+        f"""Analyze this user request and determine the appropriate response strategy:
+        User Message: {state['latest_user_message']}
+        """
+    )
+    
+    logger.info(f"Raw output from CEO agent: {result.data}")
+
+    if not result.data:
+        logger.error("Received empty output from CEO agent.")
+        return {"error": "No output received from CEO agent."}
+
+    try:
+        analysis = json.loads(result.data)
+    except json.JSONDecodeError as e:
+        logger.error(f"JSON parsing error: {e} - Output: {result.data}")
+        return {"error": "Failed to parse the analysis request."}
+
+    # Continue with the rest of the function...
+    

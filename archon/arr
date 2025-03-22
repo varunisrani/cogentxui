@@ -1,0 +1,1135 @@
+from pydantic_ai.models.openai import OpenAIModel
+from pydantic_ai import Agent, RunContext
+from langgraph.graph import StateGraph, START, END
+from langgraph.checkpoint.memory import MemorySaver
+from typing import TypedDict, Annotated, List, Any, Dict
+from langgraph.config import get_stream_writer
+from langgraph.types import interrupt
+from dotenv import load_dotenv
+from openai import AsyncOpenAI
+from supabase import Client
+import logfire
+import logging
+import os
+import sys
+from utils.utils import get_env_var
+from logging.handlers import RotatingFileHandler
+from datetime import datetime
+import json  # Ensure you have this import at the top of your file
+from archon.utils.json_utils import clean_and_parse_json  # Fix the import path
+
+# Configure logging
+def setup_logging():
+    """Configure logging to both file and console with rotation."""
+    # Create logs directory if it doesn't exist
+    current_dir = os.path.dirname(os.path.abspath(__file__))
+    parent_dir = os.path.dirname(current_dir)
+    logs_dir = os.path.join(parent_dir, "logs")
+    os.makedirs(logs_dir, exist_ok=True)
+
+    # Create a timestamp-based log filename
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    log_file = os.path.join(logs_dir, f"archon_{timestamp}.log")
+    md_file = os.path.join(logs_dir, f"archon_{timestamp}.md")
+
+    # Create formatters
+    file_formatter = logging.Formatter(
+        '%(asctime)s - %(name)s - %(levelname)s\n'
+        'File: %(filename)s - Line: %(lineno)d\n'
+        'Message: %(message)s\n'
+    )
+    console_formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+    
+    # Create markdown formatter
+    class MarkdownFormatter(logging.Formatter):
+        def format(self, record):
+            timestamp = self.formatTime(record)
+            message = record.getMessage()
+            
+            # Format the log entry in markdown
+            md_entry = f"""## {record.levelname} - {timestamp}
+### Source
+- **Module**: {record.name}
+- **File**: {record.filename}
+- **Line**: {record.lineno}
+
+### Message
+```
+{message}
+```
+
+---
+"""
+            return md_entry
+
+    # Create and configure file handler with rotation
+    file_handler = RotatingFileHandler(
+        log_file,
+        maxBytes=10*1024*1024,  # 10MB
+        backupCount=5
+    )
+    file_handler.setLevel(logging.INFO)
+    file_handler.setFormatter(file_formatter)
+
+    # Create and configure markdown handler
+    md_handler = RotatingFileHandler(
+        md_file,
+        maxBytes=10*1024*1024,  # 10MB
+        backupCount=5
+    )
+    md_handler.setLevel(logging.INFO)
+    md_handler.setFormatter(MarkdownFormatter())
+
+    # Create and configure console handler
+    console_handler = logging.StreamHandler()
+    console_handler.setLevel(logging.INFO)
+    console_handler.setFormatter(console_formatter)
+
+    # Get the root logger and configure it
+    root_logger = logging.getLogger()
+    root_logger.setLevel(logging.INFO)
+    
+    # Remove any existing handlers
+    root_logger.handlers = []
+    
+    # Add the handlers
+    root_logger.addHandler(file_handler)
+    root_logger.addHandler(md_handler)
+    root_logger.addHandler(console_handler)
+
+    return log_file, md_file
+
+# Initialize logging
+log_file, md_file = setup_logging()
+logger = logging.getLogger(__name__)
+logger.info(f"""Logging initialized
+- Log file: {log_file}
+- Markdown file: {md_file}""")
+
+# Import the message classes from Pydantic AI
+from pydantic_ai.messages import (
+    ModelMessage,
+    ModelMessagesTypeAdapter
+)
+
+# Add the parent directory to Python path
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from archon.pydantic_ai_coder import (
+    pydantic_ai_coder, 
+    PydanticAIDeps, 
+    list_documentation_pages_helper, 
+    AgentDeps,
+    ceo_agent,
+    architecture_agent,
+    implementation_agent,
+    coder_agent
+)
+from archon.crew_ai_coder import crew_ai_expert, CrewAIDeps, list_documentation_pages
+
+# Load environment variables
+load_dotenv()
+
+# Configure logfire to suppress warnings (optional)
+logfire.configure(send_to_logfire='never')
+
+base_url = get_env_var('BASE_URL') or 'https://api.openai.com/v1'
+api_key = get_env_var('LLM_API_KEY') or 'no-llm-api-key-provided'
+is_ollama = "localhost" in base_url.lower()
+reasoner_llm_model = get_env_var('REASONER_MODEL') or 'o3-mini'
+reasoner = Agent(  
+    OpenAIModel(reasoner_llm_model, base_url=base_url, api_key=api_key),
+    system_prompt="""You are an expert at defining scope and requirements for multi-agent CrewAI systems.
+    
+Your core responsibilities:
+
+1. Requirements Analysis:
+   - Understand user's needs for AI agent/crew creation
+   - Break down requirements into distinct agent roles (2-4 agents)
+   - Identify key functionalities for each agent
+   - Map required tools and integrations per agent
+
+2. Agent Role Definition:
+   - Define 2-4 specialized agent roles
+   - Ensure complementary capabilities
+   - Avoid single-agent solutions
+   - Design effective collaboration patterns
+
+3. Documentation Research:
+   - Search CrewAI documentation thoroughly
+   - Identify relevant examples and patterns
+   - Find appropriate tools for each agent
+   - Document any gaps in documentation
+
+4. Scope Definition:
+   - Create detailed project scope
+   - Define each agent's responsibilities
+   - Outline inter-agent workflows
+   - Specify success criteria per agent
+
+5. Architecture Planning:
+   - Design multi-agent structure
+   - Plan agent interactions
+   - Configure tool distribution
+   - Ensure scalable communication
+
+Always create comprehensive scope documents that include:
+1. Multi-agent architecture diagram
+2. Agent roles and responsibilities
+3. Inter-agent communication patterns
+4. Tool distribution across agents
+5. Data flow between agents
+6. Testing strategy per agent
+7. Relevant documentation references
+
+Your scope documents should enable implementation of effective multi-agent solutions."""
+)
+
+primary_llm_model = get_env_var('PRIMARY_MODEL') or 'gpt-4o-mini'
+router_agent = Agent(  
+    OpenAIModel(primary_llm_model, base_url=base_url, api_key=api_key),
+    system_prompt="""You are an expert at understanding and routing user requests in a CrewAI development workflow, even when messages contain typos or are unclear.
+    
+Your core responsibilities:
+
+1. Message Understanding:
+   - Parse user intent even with typos/unclear wording
+   - Extract key meaning from malformed messages
+   - Handle multilingual input gracefully
+   - Identify core request type regardless of format
+
+2. Request Analysis:
+   - Understand user's message intent
+   - Identify if it's a new request or continuation
+   - Determine if conversation should end
+   - Route to appropriate next step
+
+3. Conversation Flow:
+   - Maintain context between messages
+   - Track implementation progress
+   - Handle edge cases gracefully
+   - Adapt to user's communication style
+
+4. Quality Control:
+   - Verify message understanding
+   - Route unclear messages for clarification
+   - Ensure proper handling of all input types
+   - Validate routing decisions
+
+For each user message, analyze the intent and route to:
+1. "general_conversation" - For general questions or chat
+2. "create_agent" - For requests to create new agents/crews
+3. "modify_code" - For requests to edit/update existing code
+4. "unclear_input" - For messages needing clarification
+5. "end_conversation" - For requests to end the conversation
+
+Always focus on understanding the core intent, even if the message contains typos or is unclear."""
+)
+
+end_conversation_agent = Agent(  
+    OpenAIModel(primary_llm_model, base_url=base_url, api_key=api_key),
+    system_prompt="""You are an expert at providing final instructions for CrewAI agent setup and usage.
+    
+Your core responsibilities:
+
+1. Setup Instructions:
+   - Explain file organization
+   - Detail environment setup
+   - List required dependencies
+   - Provide configuration steps
+
+2. Usage Guide:
+   - Show how to run the crew
+   - Explain agent interactions
+   - Demonstrate task execution
+   - Provide example commands
+
+3. Troubleshooting:
+   - Common issues and solutions
+   - Environment variables
+   - Dependency conflicts
+   - Error messages
+
+4. Next Steps:
+   - Testing recommendations
+   - Monitoring suggestions
+   - Performance optimization
+   - Future enhancements
+
+For each conversation end:
+1. Summarize what was created
+2. List setup steps in order
+3. Show example usage
+4. Provide friendly goodbye
+
+Always ensure users have everything they need to run their CrewAI solution."""
+)
+
+openai_client=None
+
+if is_ollama:
+    openai_client = AsyncOpenAI(base_url=base_url,api_key=api_key)
+else:
+    openai_client = AsyncOpenAI(api_key=get_env_var("OPENAI_API_KEY"))
+
+if get_env_var("SUPABASE_URL"):
+    supabase: Client = Client(
+        get_env_var("SUPABASE_URL"),
+        get_env_var("SUPABASE_SERVICE_KEY")
+    )
+else:
+    supabase = None
+
+# Define state schema
+class AgentState(TypedDict):
+    latest_user_message: str
+    messages: Annotated[List[bytes], lambda x, y: x + y]
+    scope: str
+    agent_context: Dict[str, Any]
+
+# Add a custom logging formatter for agent interactions
+def log_agent_interaction(agent_name: str, prompt: str, input_data: Any = None, output_data: Any = None):
+    """Log agent interactions with detailed information."""
+    separator = "="*80
+    message = f"""## {agent_name} Interaction
+
+### System Prompt
+```
+{prompt}
+```
+"""
+    
+    if input_data:
+        message += f"""### Input
+```
+{input_data}
+```
+"""
+    
+    if output_data:
+        message += f"""### Output
+```
+{output_data}
+```
+"""
+    
+    message += "\n---\n"
+    logger.info(message)
+
+# Wrap the run methods with enhanced logging
+original_ceo_run = ceo_agent.run
+async def ceo_run_with_logging(*args, **kwargs):
+    logger.info("CEO Agent started processing request.")
+    logger.info(f"Input received: {args[0] if args else kwargs.get('prompt')}")
+    log_agent_interaction(
+        "CEO Agent",
+        ceo_agent.system_prompt,
+        args[0] if args else kwargs.get('prompt'),
+        None
+    )
+    try:
+        result = await original_ceo_run(*args, **kwargs)
+        logger.info(f"Raw output from CEO Agent: {result.data}")  # Log the raw response
+        if not result.data:
+            logger.error("CEO Agent returned an empty response.")
+            return None
+        try:
+            json_string = result.data.strip()
+            if json_string.startswith("```json"):
+                json_string = json_string[7:].strip()  # Remove ```json and any whitespace
+            if json_string.endswith("```"):
+                json_string = json_string[:-3].strip()  # Remove ``` and any whitespace
+            
+            # Decode to UTF-8 if necessary and if it's bytes
+            if isinstance(json_string, bytes):
+                json_string = json_string.decode('utf-8')
+
+            logger.info(f"String being parsed: {json_string}")  # CRUCIAL DEBUGGING
+
+            parsed_output = json.loads(json_string)
+            logger.info(f"Parsed output: {parsed_output}")
+            return parsed_output  # Return the parsed JSON
+        except json.JSONDecodeError as e:
+            logger.error(f"JSONDecodeError: {e}", exc_info=True)  # Include traceback
+            logger.error(f"Raw response was: {result.data}")  # Log the raw response on error
+            return None
+        except Exception as e:
+            logger.error(f"General error during JSON parsing: {e}", exc_info=True)
+            logger.error(f"Raw response was: {result.data}")
+            return None
+    except Exception as e:
+        logger.error("CEO Agent encountered an error", exc_info=True)
+        raise
+ceo_agent.run = ceo_run_with_logging
+
+original_arch_run = architecture_agent.run
+async def arch_run_with_logging(*args, **kwargs):
+    log_agent_interaction(
+        "Architecture Agent",
+        architecture_agent.system_prompt,
+        args[0] if args else kwargs.get('prompt'),
+        None
+    )
+    try:
+        result = await original_arch_run(*args, **kwargs)
+        log_agent_interaction(
+            "Architecture Agent",
+            architecture_agent.system_prompt,
+            None,
+            result.data
+        )
+        return result
+    except Exception as e:
+        logger.error("Architecture Agent encountered an error", exc_info=True)
+        raise
+architecture_agent.run = arch_run_with_logging
+
+original_impl_run = implementation_agent.run
+async def impl_run_with_logging(*args, **kwargs):
+    log_agent_interaction(
+        "Implementation Agent",
+        implementation_agent.system_prompt,
+        args[0] if args else kwargs.get('prompt'),
+        None
+    )
+    try:
+        result = await original_impl_run(*args, **kwargs)
+        log_agent_interaction(
+            "Implementation Agent",
+            implementation_agent.system_prompt,
+            None,
+            result.data
+        )
+        return result
+    except Exception as e:
+        logger.error("Implementation Agent encountered an error", exc_info=True)
+        raise
+implementation_agent.run = impl_run_with_logging
+
+original_coder_run = coder_agent.run
+async def coder_run_with_logging(*args, **kwargs):
+    log_agent_interaction(
+        "Coder Agent",
+        coder_agent.system_prompt,
+        args[0] if args else kwargs.get('prompt'),
+        None
+    )
+    try:
+        result = await original_coder_run(*args, **kwargs)
+        log_agent_interaction(
+            "Coder Agent",
+            coder_agent.system_prompt,
+            None,
+            result.data
+        )
+        return result
+    except Exception as e:
+        logger.error("Coder Agent encountered an error", exc_info=True)
+        raise
+coder_agent.run = coder_run_with_logging
+
+original_reasoner_run = reasoner.run
+async def reasoner_run_with_logging(*args, **kwargs):
+    log_agent_interaction(
+        "Reasoner Agent",
+        reasoner.system_prompt,
+        args[0] if args else kwargs.get('prompt'),
+        None
+    )
+    try:
+        result = await original_reasoner_run(*args, **kwargs)
+        log_agent_interaction(
+            "Reasoner Agent",
+            reasoner.system_prompt,
+            None,
+            result.data
+        )
+        return result
+    except Exception as e:
+        logger.error("Reasoner Agent encountered an error", exc_info=True)
+        raise
+reasoner.run = reasoner_run_with_logging
+
+original_router_run = router_agent.run
+async def router_run_with_logging(*args, **kwargs):
+    log_agent_interaction(
+        "Router Agent",
+        router_agent.system_prompt,
+        args[0] if args else kwargs.get('prompt'),
+        None
+    )
+    try:
+        result = await original_router_run(*args, **kwargs)
+        log_agent_interaction(
+            "Router Agent",
+            router_agent.system_prompt,
+            None,
+            result.data
+        )
+        return result
+    except Exception as e:
+        logger.error("Router Agent encountered an error", exc_info=True)
+        raise
+router_agent.run = router_run_with_logging
+
+original_end_conversation_run = end_conversation_agent.run
+async def end_conversation_run_with_logging(*args, **kwargs):
+    log_agent_interaction(
+        "End Conversation Agent",
+        end_conversation_agent.system_prompt,
+        args[0] if args else kwargs.get('prompt'),
+        None
+    )
+    try:
+        result = await original_end_conversation_run(*args, **kwargs)
+        log_agent_interaction(
+            "End Conversation Agent",
+            end_conversation_agent.system_prompt,
+            None,
+            result.data
+        )
+        return result
+    except Exception as e:
+        logger.error("End Conversation Agent encountered an error", exc_info=True)
+        raise
+end_conversation_agent.run = end_conversation_run_with_logging
+
+# Scope Definition Node with Reasoner LLM
+async def define_scope_with_reasoner(state: AgentState):
+    logger.info("\n" + "="*80 + "\nStarting scope definition phase\n" + "="*80)
+    if 'agent_context' not in state:
+        state['agent_context'] = {}
+
+    prompt = f"""
+    User AI Agent Request: {state['latest_user_message']}
+
+    If the user message is too brief or unclear (e.g., a simple 'hi'), please ask for clarification and do not create a detailed scope document.
+    Otherwise, create a detailed scope document for the AI agent including:
+    - Architecture diagram
+    - Core components
+    - External dependencies
+    - Testing strategy
+
+    NOTE: Do not load documentation automatically. If you require documentation references during the process,
+    please call the tool 'retrieve_relevant_documentation' to fetch the necessary information.
+    """
+
+    log_agent_interaction(
+        "Scope Definition",
+        prompt,
+        state['latest_user_message'],
+        None
+    )
+
+    result = await reasoner.run(prompt)
+    
+    # Get scope content based on result type
+    if hasattr(result, 'data'):
+        scope = result.data
+    elif isinstance(result, dict):
+        scope = result.get('content', str(result))
+    else:
+        scope = str(result)
+
+    current_dir = os.path.dirname(os.path.abspath(__file__))
+    parent_dir = os.path.dirname(current_dir)
+    scope_path = os.path.join(parent_dir, "workbench", "scope.md")
+    os.makedirs(os.path.join(parent_dir, "workbench"), exist_ok=True)
+
+    with open(scope_path, "w", encoding="utf-8") as f:
+        f.write(scope)
+    
+    log_agent_interaction(
+        "Scope Definition",
+        prompt,
+        None,
+        scope
+    )
+    
+    logger.info("Completed scope definition phase")
+    return {"scope": scope, "agent_context": state['agent_context']}
+
+# Coding Node with Feedback Handling
+async def coding_node(state: AgentState, writer):    
+    logger.info("Starting code implementation phase")
+    # Prepare dependencies
+    deps = PydanticAIDeps(
+        supabase=supabase,
+        openai_client=openai_client,
+        reasoner_output=state['scope']
+    )
+
+    # Get the message history into the format for Pydantic AI
+    message_history: list[ModelMessage] = []
+    for message_row in state['messages']:
+        message_history.extend(ModelMessagesTypeAdapter.validate_json(message_row))
+
+    # Run the agent in a stream
+    if is_ollama:
+        writer = get_stream_writer()
+        result = await pydantic_ai_coder.run(state['latest_user_message'], deps=deps, message_history=message_history)
+        writer(result.data)
+        state['agent_context']['implementation'] = result.data
+    else:
+        implementation_text = []
+        async with pydantic_ai_coder.run_stream(
+            state['latest_user_message'],
+            deps=deps,
+            message_history=message_history
+        ) as result:
+            # Stream partial text as it arrives
+            async for chunk in result.stream_text(delta=True):
+                writer(chunk)
+                implementation_text.append(chunk)
+        state['agent_context']['implementation'] = ''.join(implementation_text)
+
+    logger.info("Completed code implementation phase")
+    return {"messages": [result.new_messages_json()], "agent_context": state['agent_context']}
+
+# Interrupt the graph to get the user's next message
+def get_next_user_message(state: AgentState):
+    value = interrupt({})
+
+    # Set the user's latest message for the LLM to continue the conversation
+    return {
+        "latest_user_message": value
+    }
+
+# Determine if the user is finished creating their AI agent or not
+async def route_user_message(state: AgentState):
+    message = state['latest_user_message'].strip().lower()
+    if len(message) < 10 or message in ['hi', 'hello', 'hey']:
+        return "direct_ceo"
+
+    if message.startswith('create agent') or 'create a' in message and ('agent' in message or 'crew' in message):
+        logger.info("Agent creation request detected - starting full workflow")
+        state['agent_context'] = {
+            'requires_more_agents': True,
+            'analysis_type': 'full_implementation',
+            'project_spec': state['latest_user_message']
+        }
+        return "ceo_analysis"
+
+    prompt = f"""
+The user has sent the following message:
+
+{state['latest_user_message']}
+
+Analyze this message and determine the most appropriate response type by replying with exactly one of the following options (without quotes):
+
+- "general_conversation": For general questions or chat.
+- "create_agent": If the user is requesting to create a new agent/crew (look for keywords like 'create', 'build', 'make', 'develop').
+- "modify_agent": If the user wants to update or modify an existing agent.
+- "delete_agent": If the user is requesting deletion of an agent or related code.
+- "finish_conversation": If the user wants to end the conversation.
+
+NOTE: If the message contains phrases about creating, building, or developing agents/crews, ALWAYS return "create_agent".
+"""
+
+    result = await router_agent.run(prompt)
+    request_type = result.data.strip().lower()
+
+    logger.info(f"Request type determined: {request_type}")
+
+    if request_type == "create_agent":
+        logger.info("Routing to full agent creation workflow")
+        state['agent_context'] = {
+            'requires_more_agents': True,
+            'analysis_type': 'full_implementation',
+            'project_spec': state['latest_user_message']
+        }
+        return "ceo_analysis"
+    elif request_type in ["modify_agent", "delete_agent"]:
+        logger.info("Routing to direct coder handling")
+        return "direct_coder"
+    else:
+        logger.info("Routing to direct CEO handling")
+        return "direct_ceo"
+
+# End of conversation agent to give instructions for executing the agent
+async def finish_conversation(state: AgentState, writer):    
+    """End of conversation agent to give instructions for executing the agent"""
+    logger.info("Starting finish conversation phase")
+    
+    # Get the message history into the format for Pydantic AI
+    message_history: list[ModelMessage] = []
+    for message_row in state['messages']:
+        message_history.extend(ModelMessagesTypeAdapter.validate_json(message_row))
+
+    # Run the agent in a stream
+    if is_ollama:
+        writer = get_stream_writer()
+        result = await end_conversation_agent.run(state['latest_user_message'], message_history=message_history)
+        
+        # Process the result based on its type
+        result_content = ""
+        if hasattr(result, 'data'):
+            result_content = result.data
+        elif isinstance(result, dict):
+            result_content = result.get('content', str(result))
+        else:
+            result_content = str(result)
+            
+        # Write the result to the stream
+        writer(result_content)
+    else: 
+        async with end_conversation_agent.run_stream(
+            state['latest_user_message'],
+            message_history=message_history
+        ) as result:
+            # Stream partial text as it arrives
+            async for chunk in result.stream_text(delta=True):
+                writer(chunk)
+
+    # Return messages based on the result type
+    if hasattr(result, 'new_messages_json'):
+        return {"messages": [result.new_messages_json()]}
+    else:
+        # Create a simple message format if result doesn't have new_messages_json method
+        content = ""
+        if hasattr(result, 'data'):
+            content = result.data
+        elif isinstance(result, dict):
+            content = result.get('content', str(result))
+        else:
+            content = str(result)
+            
+        logger.info("Completed finish conversation phase")
+        return {"messages": [{"role": "assistant", "content": content}]}
+
+# First define all agent functions
+async def ceo_analysis(state: AgentState, writer):
+    """CEO Agent analyzes the user request and determines the appropriate response strategy."""
+    logger.info("Starting CEO analysis phase")
+    logger.info("CEO Agent started processing request.")
+    deps = AgentDeps(
+        supabase=supabase,
+        openai_client=openai_client,
+        reasoner_output=state['scope'],
+        agent_context=state.get('agent_context', {})
+    )
+    
+    # Prepare the prompt for the CEO agent
+    prompt = f"""Analyze this user request and determine the appropriate response strategy:
+
+User Message: {state['latest_user_message']}
+
+Please provide your analysis in the following JSON format:
+{{
+    "analysis_type": "simple_response" | "full_implementation",
+    "requires_additional_agents": boolean,
+    "project_specification": string,
+    "reasoning": string
+}}
+
+Guidelines for analysis:
+1. Use "simple_response" if this is a general question, greeting, or clarification
+2. Use "full_implementation" if this requires creating or significantly modifying agents
+3. Set requires_additional_agents to true ONLY for agent creation requests that need architecture and implementation
+4. Provide detailed project_specification for full implementations
+5. Include your reasoning for the decision
+
+For agent creation requests:
+- Always set requires_additional_agents to true
+- Include comprehensive project specifications
+- Proceed directly with implementation without asking questions
+
+For general conversation or simple requests:
+- Set requires_additional_agents to false
+- Keep project_specification brief
+- Explain why a simple response is sufficient"""
+
+    logger.info(f"Input received: {prompt}")
+    
+    # Log the interaction
+    log_agent_interaction("CEO Agent", ceo_agent.system_prompt, prompt, None)
+    
+    # Run the CEO agent
+    logger.info("## CEO Agent Interaction")
+    logger.info(f"### System Prompt\n```\n{ceo_agent.system_prompt}\n```")
+    logger.info(f"### Input\n```\n{prompt}\n```")
+    
+    # Call the CEO agent
+    logger.info("CEO Agent started processing with prompt: {prompt}")
+    result = await ceo_agent.run(prompt)
+    logger.info("CEO Agent completed processing")
+    
+    try:
+        # Parse the CEO's analysis
+        if hasattr(result, 'data'):
+            raw_output = result.data
+        elif isinstance(result, dict):
+            raw_output = result.get('content', str(result))
+        else:
+            raw_output = str(result)
+            
+        logger.info(f"Raw output from CEO Agent: ```json\n{raw_output}\n```")
+        
+        if not raw_output:
+            logger.error("CEO Agent returned an empty response.")
+            raise ValueError("Empty response from CEO Agent")
+            
+        # Use the new utility function to clean and parse the JSON
+        try:
+            parsed_output = clean_and_parse_json(raw_output)
+            logger.info(f"Parsed output: {parsed_output}")
+            
+            # Update the agent context with the parsed output
+            state['agent_context'].update({
+                'analysis_type': parsed_output['analysis_type'],
+                'requires_more_agents': parsed_output['requires_additional_agents'],
+                'project_spec': parsed_output['project_specification'],
+                'ceo_reasoning': parsed_output['reasoning']
+            })
+            
+            # Log the decision
+            logger.info(f"CEO Analysis Results:\n- Analysis Type: {parsed_output['analysis_type']}\n- Requires More Agents: {parsed_output['requires_additional_agents']}\n- Reasoning: {parsed_output['reasoning']}")
+        except (json.JSONDecodeError, KeyError) as e:
+            logger.error(f"Error parsing CEO analysis: {e}")
+            logger.error(f"Raw response was: {raw_output}")
+            
+            # Handle the error appropriately, possibly defaulting to a simple response
+            if 'create agent' in state['latest_user_message'].lower():
+                logger.info("Detected agent creation request, defaulting to full implementation")
+                state['agent_context'].update({
+                    'analysis_type': 'full_implementation',
+                    'requires_more_agents': True,
+                    'project_spec': state['latest_user_message'],
+                    'ceo_reasoning': 'Parsing error in agent creation request - defaulting to full implementation'
+                })
+            else:
+                # Default to simpler interaction for other requests
+                logger.info("Defaulting to simple response for non-agent request")
+                state['agent_context'].update({
+                    'analysis_type': 'simple_response',
+                    'requires_more_agents': False,
+                    'project_spec': state['latest_user_message'],
+                    'ceo_reasoning': 'Parsing error, defaulting to simple response'
+                })
+    except Exception as e:
+        logger.error(f"Unexpected error in CEO analysis: {str(e)}", exc_info=True)
+        # Set default values in case of unexpected errors
+        state['agent_context'].update({
+            'analysis_type': 'simple_response',
+            'requires_more_agents': False,
+            'project_spec': state['latest_user_message'],
+            'ceo_reasoning': f'Error during analysis: {str(e)}'
+        })
+    
+    logger.info(f"CEO Analysis complete. Requires more agents: {state['agent_context'].get('requires_more_agents')}")
+    return {"agent_context": state['agent_context']}
+
+async def architecture_planning(state: AgentState, writer):
+    """Architecture Agent creates system design"""
+    logger.info("Starting architecture planning phase")
+    deps = AgentDeps(
+        supabase=supabase,
+        openai_client=openai_client,
+        reasoner_output=state['scope'],
+        agent_context=state['agent_context']
+    )
+    
+    result = await architecture_agent.run(
+        f"""Create architectural design based on this specification:
+        {state['agent_context']['project_spec']}"""
+    )
+    
+    # Store the architecture based on result type
+    if hasattr(result, 'data'):
+        state['agent_context']['architecture'] = result.data
+    elif isinstance(result, dict):
+        state['agent_context']['architecture'] = result.get('content', str(result))
+    else:
+        state['agent_context']['architecture'] = str(result)
+        
+    logger.info("Completed architecture planning phase")
+    return {"agent_context": state['agent_context']}
+
+async def implementation_planning(state: AgentState, writer):
+    """Implementation Planning Agent creates detailed technical specifications"""
+    logger.info("Starting implementation planning phase")
+    deps = AgentDeps(
+        supabase=supabase,
+        openai_client=openai_client,
+        reasoner_output=state['scope'],
+        agent_context=state['agent_context']
+    )
+    
+    result = await implementation_agent.run(
+        f"""Create detailed technical specifications based on:
+        Project Spec: {state['agent_context']['project_spec']}
+        Architecture: {state['agent_context'].get('architecture', 'Not provided')}
+        """
+    )
+    
+    # Store the implementation plan based on result type
+    if hasattr(result, 'data'):
+        state['agent_context']['implementation_plan'] = result.data
+    elif isinstance(result, dict):
+        state['agent_context']['implementation_plan'] = result.get('content', str(result))
+    else:
+        state['agent_context']['implementation_plan'] = str(result)
+        
+    logger.info("Completed implementation planning phase")
+    return {"agent_context": state['agent_context']}
+
+async def code_implementation(state: AgentState, writer):
+    """Code Implementation Agent implements the solution"""
+    logger.info("Starting code implementation phase")
+    deps = AgentDeps(
+        supabase=supabase,
+        openai_client=openai_client,
+        reasoner_output=state['scope'],
+        agent_context=state['agent_context']
+    )
+    
+    result = await coder_agent.run(
+        f"""Implement the solution based on:
+        Project Spec: {state['agent_context']['project_spec']}
+        Architecture: {state['agent_context'].get('architecture', 'Not provided')}
+        Implementation Plan: {state['agent_context']['implementation_plan']}
+        """
+    )
+    
+    # Store the implementation based on result type
+    if hasattr(result, 'data'):
+        state['agent_context']['implementation'] = result.data
+    elif isinstance(result, dict):
+        state['agent_context']['implementation'] = result.get('content', str(result))
+    else:
+        state['agent_context']['implementation'] = str(result)
+        
+    logger.info("Completed code implementation phase")
+    return {"agent_context": state['agent_context']}
+
+async def ceo_validation(state: AgentState, writer):
+    """CEO Agent validates the implementation"""
+    logger.info("Starting CEO validation phase")
+    deps = AgentDeps(
+        supabase=supabase,
+        openai_client=openai_client,
+        reasoner_output=state['scope'],
+        agent_context=state['agent_context']
+    )
+    
+    # Prepare the validation prompt
+    validation_prompt = f"""Validate this implementation against the original requirements:
+    
+    Original Request: {state['latest_user_message']}
+    Project Spec: {state['agent_context'].get('project_spec', 'Not provided')}
+    Implementation: {state['agent_context'].get('implementation', 'Not provided')}
+    
+    If the implementation meets the requirements, respond with "APPROVED" followed by your reasoning.
+    If changes are needed, respond with "CHANGES REQUESTED" followed by specific feedback.
+    """
+    
+    # Log the validation request
+    logger.info(f"Validation request: {validation_prompt}")
+    
+    # Run the CEO agent for validation
+    result = await ceo_agent.run(validation_prompt)
+    
+    # Process the result based on its type
+    result_content = ""
+    if hasattr(result, 'data'):
+        result_content = result.data
+    elif isinstance(result, dict):
+        result_content = result.get('content', str(result))
+    else:
+        result_content = str(result)
+    
+    # Store the validation result
+    state['agent_context']['validation'] = result_content
+    
+    # Check if the implementation is approved
+    is_approved = "APPROVED" in result_content
+    logger.info(f"Implementation {'approved' if is_approved else 'changes requested'}")
+    
+    # Stream the validation to the user
+    if writer:
+        writer(result_content)
+    
+    # Return the updated state
+    logger.info("Completed CEO validation phase")
+    return {"agent_context": state['agent_context']}
+
+async def direct_ceo_handling(state: AgentState, writer):
+    """Direct handling of general questions and unclear input by CEO agent."""
+    logger.info("Starting direct CEO handling")
+    deps = AgentDeps(
+        supabase=supabase,
+        openai_client=openai_client,
+        reasoner_output=state.get('scope', ''),
+        agent_context=state.get('agent_context', {})
+    )
+    
+    # Check if this is a greeting or very short message
+    message = state['latest_user_message'].strip().lower()
+    if len(message) < 10 or message in ['hi', 'hello', 'hey']:
+        greeting_prompt = """Provide a friendly greeting and encourage the user to share their needs. Example:
+        'Hello! I'm here to help you create AI agents and crews. Feel free to tell me what you'd like to build!'"""
+        result = await ceo_agent.run(greeting_prompt)
+    else:
+        # For all other messages, proceed with direct response
+        result = await ceo_agent.run(
+            f"""Provide a direct, helpful response to this user message:
+            {state['latest_user_message']}
+            
+            Guidelines:
+            1. If it's a general question:
+               - Answer directly and concisely
+               - Include relevant examples if helpful
+               
+            2. If it's about agent creation:
+               - Acknowledge the request
+               - Proceed with implementation
+               - Do NOT ask clarifying questions
+               
+            3. Always maintain a friendly, professional tone
+            """
+        )
+    
+    # Handle the result based on its type
+    if is_ollama:
+        writer = get_stream_writer()
+        # Improved result handling
+        result_content = ""
+        if hasattr(result, 'data'):
+            result_content = result.data
+        elif isinstance(result, dict):
+            result_content = result.get('content', str(result))
+        else:
+            result_content = str(result)
+        writer(result_content)
+    else:
+        # Improved result handling
+        result_content = ""
+        if hasattr(result, 'data'):
+            result_content = result.data
+        elif isinstance(result, dict):
+            result_content = result.get('content', str(result))
+        else:
+            result_content = str(result)
+        writer(result_content)
+    
+    # Return messages based on the result type
+    if hasattr(result, 'new_messages_json'):
+        return {"messages": [result.new_messages_json()]}
+    else:
+        # Create a simple message format if result doesn't have new_messages_json method
+        return {"messages": [{"role": "assistant", "content": str(result_content)}]}
+
+async def direct_coder_handling(state: AgentState, writer):
+    """Direct handling of edit/delete requests by coder agent."""
+    logger.info("Starting direct coder handling")
+    deps = AgentDeps(
+        supabase=supabase,
+        openai_client=openai_client,
+        reasoner_output=state.get('scope', ''),
+        agent_context=state.get('agent_context', {})
+    )
+    
+    result = await coder_agent.run(
+        f"""Handle this edit/delete request for CrewAI agent/crew code:
+        {state['latest_user_message']}"""
+    )
+    
+    # Handle the result based on its type
+    if is_ollama:
+        writer = get_stream_writer()
+        # Improved result handling
+        result_content = ""
+        if hasattr(result, 'data'):
+            result_content = result.data
+        elif isinstance(result, dict):
+            result_content = result.get('content', str(result))
+        else:
+            result_content = str(result)
+        writer(result_content)
+    else:
+        # Improved result handling
+        result_content = ""
+        if hasattr(result, 'data'):
+            result_content = result.data
+        elif isinstance(result, dict):
+            result_content = result.get('content', str(result))
+        else:
+            result_content = str(result)
+        writer(result_content)
+    
+    # Return messages based on the result type
+    if hasattr(result, 'new_messages_json'):
+        return {"messages": [result.new_messages_json()]}
+    else:
+        # Create a simple message format if result doesn't have new_messages_json method
+        return {"messages": [{"role": "assistant", "content": str(result_content)}]}
+
+# Add the decision function before the graph builder
+def decide_next_after_ceo(state: AgentState) -> str:
+    """Determine the next step after CEO analysis based on the analysis results"""
+    requires_more_agents = state['agent_context'].get('requires_more_agents', False)
+    analysis_type = state['agent_context'].get('analysis_type', 'simple_response')
+    
+    logger.info(f"Deciding next step after CEO analysis: requires_more_agents={requires_more_agents}, analysis_type={analysis_type}")
+    
+    if requires_more_agents or analysis_type == "full_implementation" or state['agent_context'].get('requires_more_agents', False):
+        logger.info("Proceeding with full implementation workflow")
+        return "architecture_planning"
+    
+    logger.info("Proceeding with direct CEO response")
+    return "direct_ceo"
+
+# Build workflow
+builder = StateGraph(AgentState)
+
+# Add nodes for our agent workflow
+builder.add_node("define_scope_with_reasoner", define_scope_with_reasoner)
+builder.add_node("ceo_analysis", ceo_analysis)
+builder.add_node("architecture_planning", architecture_planning)
+builder.add_node("implementation_planning", implementation_planning)
+builder.add_node("coding_node", coding_node)
+builder.add_node("ceo_validation", ceo_validation)
+builder.add_node("get_next_user_message", get_next_user_message)
+builder.add_node("finish_conversation", finish_conversation)
+builder.add_node("direct_ceo", direct_ceo_handling)
+builder.add_node("direct_coder", direct_coder_handling)
+
+# Set up the initial workflow edges
+builder.add_edge(START, "define_scope_with_reasoner")
+builder.add_edge("define_scope_with_reasoner", "ceo_analysis")
+
+# Add conditional routing after CEO analysis
+builder.add_conditional_edges(
+    "ceo_analysis",
+    decide_next_after_ceo,
+    {
+        "direct_ceo": "direct_ceo",
+        "architecture_planning": "architecture_planning"
+    }
+)
+
+# Set up the full implementation workflow
+builder.add_edge("architecture_planning", "implementation_planning")
+builder.add_edge("implementation_planning", "coding_node")
+builder.add_edge("coding_node", "ceo_validation")
+builder.add_edge("ceo_validation", "get_next_user_message")
+
+# Add routing for next user message
+builder.add_conditional_edges(
+    "get_next_user_message",
+    route_user_message,
+    {
+        "ceo_analysis": "ceo_analysis",
+        "direct_ceo": "direct_ceo",
+        "direct_coder": "direct_coder",
+        "finish_conversation": "finish_conversation"
+    }
+)
+
+# Add edges for completion
+builder.add_edge("direct_ceo", "get_next_user_message")
+builder.add_edge("direct_coder", "get_next_user_message")
+builder.add_edge("finish_conversation", END)
+
+# Configure persistence
+memory = MemorySaver()
+agentic_flow = builder.compile(checkpointer=memory)

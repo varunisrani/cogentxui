@@ -14,11 +14,30 @@ body {
 }
 
 :root {
-  --gradient-opacity: 0.8;
-  --primary-color: rgba(158, 117, 240, var(--gradient-opacity));
-  --secondary-color: rgba(138, 43, 226, var(--gradient-opacity));
-  --accent-color: rgba(128, 59, 239, var(--gradient-opacity));
+  --gradient-opacity: 0.9;
+  --primary-color: rgba(120, 120, 120, var(--gradient-opacity));
+  --secondary-color: rgba(80, 80, 80, var(--gradient-opacity));
+  --accent-color: rgba(255, 60, 60, var(--gradient-opacity));
   // --primary-color: rgba(147, 112, 219, var(--gradient-opacity));
   // --secondary-color: rgba(138, 43, 226, var(--gradient-opacity));
   // --accent-color: rgba(180, 170, 220, var(--gradient-opacity));
+}
+
+/* Premium UI enhancements */
+body {
+  background-color: var(--bolt-elements-bg-depth-1);
+}
+
+/* Subtle glass effect for inputs and buttons */
+input, 
+button,
+.input-container,
+.action-button,
+.menu-button {
+  backdrop-filter: blur(10px);
+}
+
+/* Add subtle text shadow to headings */
+h1, h2, h3, .cogentx {
+  text-shadow: 0 0 10px rgba(255, 255, 255, 0.2);
 }

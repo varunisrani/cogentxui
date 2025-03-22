@@ -1,45 +1,98 @@
-/*
+/**
  * @ts-nocheck
  * Preventing TS checks with files presented in the video for a better presentation.
  */
 import { useStore } from '@nanostores/react';
 import type { Message } from 'ai';
-import { useChat } from 'ai/react';
 import { useAnimate } from 'framer-motion';
-import { memo, useCallback, useEffect, useRef, useState } from 'react';
-import { cssTransition, toast, ToastContainer } from 'react-toastify';
-import { useMessageParser, usePromptEnhancer, useShortcuts, useSnapScroll } from '~/lib/hooks';
+import { memo, useCallback, useEffect, useRef, useState, Suspense } from 'react';
+import { toast, ToastContainer } from 'react-toastify';
+import { useMessageParser, useShortcuts, useSnapScroll } from '~/lib/hooks';
 import { description, useChatHistory } from '~/lib/persistence';
 import { chatStore } from '~/lib/stores/chat';
 import { workbenchStore } from '~/lib/stores/workbench';
-import { DEFAULT_MODEL, DEFAULT_PROVIDER, PROMPT_COOKIE_KEY, PROVIDER_LIST } from '~/utils/constants';
+import { PROMPT_COOKIE_KEY, SHOW_RAW_API_RESPONSES } from '~/utils/constants';
 import { cubicEasingFn } from '~/utils/easings';
 import { createScopedLogger, renderLogger } from '~/utils/logger';
 import { BaseChat } from './BaseChat';
 import Cookies from 'js-cookie';
 import { debounce } from '~/utils/debounce';
 import { useSettings } from '~/lib/hooks/useSettings';
-import type { ProviderInfo } from '~/types/model';
 import { useSearchParams } from '@remix-run/react';
 import { createSampler } from '~/utils/sampler';
-import { getTemplates, selectStarterTemplate } from '~/utils/selectStarterTemplate';
 import { logStore } from '~/lib/stores/logs';
 import { streamingState } from '~/lib/stores/streaming';
 import { filesToArtifacts } from '~/utils/fileUtils';
+import { useStreamingChat } from '~/lib/hooks/useCustomChat';
+import { ScreenshotStateManager } from './ScreenshotStateManager';
 
-const toastAnimation = cssTransition({
-  enter: 'animated fadeInRight',
-  exit: 'animated fadeOutRight',
-});
+// API URL for our backend
+const API_URL = 'http://localhost:8001';
 
 const logger = createScopedLogger('Chat');
+
+// Define types for API responses
+interface ApiHealthResponse {
+  status: string;
+  components?: {
+    api: boolean;
+  };
+  active_connections?: number;
+  timestamp?: number;
+}
+
+interface ApiChatResponse {
+  response: string;
+  thread_id: string;
+  success: boolean;
+  is_first_message?: boolean;
+}
+
+// Simple inline debug panel component that won't cause rendering issues
+function SimpleDebugPanel() {
+  if (!SHOW_RAW_API_RESPONSES) return null;
+  
+  try {
+    const debugMessages = useStore(workbenchStore.debugMessages);
+    if (!debugMessages || debugMessages.length === 0) return null;
+    
+    return (
+      <div className="fixed bottom-4 right-4 z-50 max-w-md max-h-96 overflow-auto bg-black bg-opacity-90 text-white rounded-lg p-4 border border-gray-700 text-xs">
+        <div className="flex justify-between items-center mb-2">
+          <h3 className="font-bold">API Debug Information</h3>
+          <button onClick={() => workbenchStore.debugMessages.set([])} className="text-gray-400 hover:text-white">
+            Clear
+          </button>
+        </div>
+        <div className="space-y-2">
+          {debugMessages.map((message, index) => (
+            <div key={index} className={`p-2 rounded ${message.type === 'api-error' ? 'bg-red-900 bg-opacity-40' : 'bg-gray-800'}`}>
+              <div className="font-semibold text-xs mb-1">{message.type} - {message.timestamp ? new Date(message.timestamp).toLocaleTimeString() : 'No timestamp'}</div>
+              <pre className="whitespace-pre-wrap text-xs overflow-x-auto">{message.content}</pre>
+            </div>
+          ))}
+        </div>
+      </div>
+    );
+  } catch (error) {
+    console.error("Error rendering debug panel:", error);
+    return null;
+  }
+}
 
 export function Chat() {
   renderLogger.trace('Chat');
 
   const { ready, initialMessages, storeMessageHistory, importChat, exportChat } = useChatHistory();
   const title = useStore(description);
+  
+  // Initialize debugMessages if not already initialized
   useEffect(() => {
+    // Make sure debugMessages is initialized
+    if (!workbenchStore.debugMessages.get()) {
+      workbenchStore.debugMessages.set([]);
+    }
+    
     workbenchStore.setReloadedMessages(initialMessages.map((m) => m.id));
   }, [initialMessages]);
 
@@ -63,9 +116,6 @@ export function Chat() {
           );
         }}
         icon={({ type }) => {
-          /**
-           * @todo Handle more types if we need them. This may require extra color palettes.
-           */
           switch (type) {
             case 'success': {
               return <div className="i-ph:check-bold text-bolt-elements-icon-success text-2xl" />;
@@ -79,8 +129,9 @@ export function Chat() {
         }}
         position="bottom-right"
         pauseOnFocusLoss
-        transition={toastAnimation}
       />
+      {/* Conditionally render APIDebugPanel with error boundary */}
+      {SHOW_RAW_API_RESPONSES && <SimpleDebugPanel />}
     </>
   );
 }
@@ -123,22 +174,106 @@ export const ChatImpl = memo(
     const [fakeLoading, setFakeLoading] = useState(false);
     const files = useStore(workbenchStore.files);
     const actionAlert = useStore(workbenchStore.alert);
-    const { activeProviders, promptId, autoSelectTemplate, contextOptimizationEnabled } = useSettings();
-
-    const [model, setModel] = useState(() => {
-      const savedModel = Cookies.get('selectedModel');
-      return savedModel || DEFAULT_MODEL;
-    });
-    const [provider, setProvider] = useState(() => {
-      const savedProvider = Cookies.get('selectedProvider');
-      return (PROVIDER_LIST.find((p) => p.name === savedProvider) || DEFAULT_PROVIDER) as ProviderInfo;
-    });
+    const { contextOptimizationEnabled } = useSettings();
+    const [apiStatus, setApiStatus] = useState<'checking' | 'ready' | 'error'>('checking');
+    const [apiError, setApiError] = useState<string | null>(null);
 
     const { showChat } = useStore(chatStore);
 
     const [animationScope, animate] = useAnimate();
 
-    const [apiKeys, setApiKeys] = useState<Record<string, string>>({});
+    // Check API health on component mount
+    useEffect(() => {
+      const checkApiHealth = async () => {
+        try {
+          // Initialize workbenchStore.debugMessages if it doesn't exist yet
+          if (!workbenchStore.debugMessages.get()) {
+            workbenchStore.debugMessages.set([]);
+          }
+          
+          const response = await fetch('/api/health');
+          
+          // Save raw response text for debugging
+          let rawResponseText = '';
+          try {
+            rawResponseText = await response.clone().text();
+          } catch (textError) {
+            rawResponseText = 'Failed to get response text';
+          }
+          
+          let rawData: any = { status: 'unknown' };
+          
+          try {
+            // Try to parse JSON response
+            rawData = JSON.parse(rawResponseText);
+          } catch (parseError) {
+            // If not valid JSON, use the raw text
+            rawData = { rawText: rawResponseText, status: 'parse_error' };
+          }
+          
+          // Type the response explicitly with safe fallbacks
+          const data: ApiHealthResponse = {
+            status: rawData.status || 'unknown',
+            ...rawData
+          };
+          
+          // Log API health information to the console (only in development)
+          if (process.env.NODE_ENV === 'development') {
+            console.info('API Health Check:', data);
+          }
+          
+          if (SHOW_RAW_API_RESPONSES) {
+            // Safely add debug message with error handling
+            try {
+              workbenchStore.addDebugMessage({
+                type: 'api-status',
+                content: `API Status: ${JSON.stringify(data, null, 2)}`,
+                timestamp: new Date().toISOString()
+              });
+            } catch (debugError) {
+              console.error('Error adding debug message:', debugError);
+            }
+          }
+          
+          // Only log successful health checks
+          if (data.status === 'ok') {
+            logger.info('API health check:', data);
+            setApiStatus('ready');
+          } else {
+            // Silent failure for error states but store information
+            setApiStatus('error');
+            setApiError(data.status);
+          }
+        } catch (err) {
+          // Silent failure for connection errors but store more details
+          const errorMessage = err instanceof Error ? err.message : 'Unknown connection error';
+          setApiStatus('error');
+          setApiError('connection_failed');
+          
+          if (SHOW_RAW_API_RESPONSES) {
+            // Safely add error debug message
+            try {
+              workbenchStore.addDebugMessage({
+                type: 'api-error',
+                content: `API Connection Error: ${errorMessage}`,
+                timestamp: new Date().toISOString()
+              });
+            } catch (debugError) {
+              console.error('Error adding debug message:', debugError);
+            }
+          }
+        }
+      };
+      
+      // Wrap in try-catch to prevent component from crashing
+      try {
+        checkApiHealth();
+      } catch (err) {
+        console.error('Critical error in API health check:', err);
+        setApiStatus('error');
+        setApiError('critical_error');
+      }
+    }, []);
 
     const {
       messages,
@@ -153,68 +288,44 @@ export const ChatImpl = memo(
       error,
       data: chatData,
       setData,
-    } = useChat({
-      api: '/api/chat',
+    } = useStreamingChat({
       body: {
-        apiKeys,
         files,
-        promptId,
         contextOptimization: contextOptimizationEnabled,
       },
       sendExtraMessageFields: true,
       onError: (e) => {
-        logger.error('Request failed\n\n', e, error);
-        logStore.logError('Chat request failed', e, {
+        // Silent error logging - only log to debug
+        logger.debug('Request issue occurred:', e.message);
+        logStore.logError('Chat request issue', e, {
           component: 'Chat',
           action: 'request',
           error: e.message,
         });
-        toast.error(
-          'There was an error processing your request: ' + (e.message ? e.message : 'No details were returned'),
-        );
+        // No toast error displayed
       },
-      onFinish: (message, response) => {
-        const usage = response.usage;
+      onFinish: (message) => {
         setData(undefined);
-
-        if (usage) {
-          console.log('Token usage:', usage);
-          logStore.logProvider('Chat response completed', {
-            component: 'Chat',
-            action: 'response',
-            model,
-            provider: provider.name,
-            usage,
-            messageLength: message.content.length,
-          });
-        }
-
         logger.debug('Finished streaming');
       },
       initialMessages,
       initialInput: Cookies.get(PROMPT_COOKIE_KEY) || '',
     });
+
     useEffect(() => {
       const prompt = searchParams.get('prompt');
-
-      // console.log(prompt, searchParams, model, provider);
 
       if (prompt) {
         setSearchParams({});
         runAnimation();
         append({
           role: 'user',
-          content: [
-            {
-              type: 'text',
-              text: `[Model: ${model}]\n\n[Provider: ${provider.name}]\n\n${prompt}`,
-            },
-          ] as any, // Type assertion to bypass compiler check
+          content: prompt,
+          id: crypto.randomUUID(),
         });
       }
-    }, [model, provider, searchParams]);
+    }, [searchParams]);
 
-    const { enhancingPrompt, promptEnhanced, enhancePrompt, resetEnhancer } = usePromptEnhancer();
     const { parsedMessages, parseMessages } = useMessageParser();
 
     const TEXTAREA_MAX_HEIGHT = chatStarted ? 400 : 200;
@@ -249,8 +360,6 @@ export const ChatImpl = memo(
       logStore.logProvider('Chat response aborted', {
         component: 'Chat',
         action: 'abort',
-        model,
-        provider: provider.name,
       });
     };
 
@@ -282,6 +391,166 @@ export const ChatImpl = memo(
       setChatStarted(true);
     };
 
+    // Direct API chat function for first message
+    const sendDirectApiChatMessage = async (message: string) => {
+      try {
+        logger.info('Sending direct API message:', message);
+        setFakeLoading(true);
+        
+        // Store raw response for debugging display
+        let rawResponseData = null;
+        
+        const response = await fetch(`${API_URL}/api/chat`, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify({
+            message,
+            thread_id: undefined,  // First message doesn't have a thread ID
+          }),
+        });
+        
+        // Save raw response text for debugging
+        let rawResponseText = '';
+        try {
+          rawResponseText = await response.clone().text();
+        } catch (textError) {
+          rawResponseText = 'Failed to get response text';
+        }
+        
+        if (!response.ok) {
+          // Display error in UI when SHOW_RAW_API_RESPONSES is true
+          if (SHOW_RAW_API_RESPONSES) {
+            const errorContent = `API Error (${response.status}): ${rawResponseText}`;
+            
+            // Add to debug messages
+            try {
+              workbenchStore.addDebugMessage({
+                type: 'api-error',
+                content: errorContent,
+                timestamp: new Date().toISOString()
+              });
+            } catch (debugError) {
+              console.error('Error adding debug message:', debugError);
+            }
+            
+            setMessages([
+              {
+                id: crypto.randomUUID(),
+                role: 'user',
+                content: message,
+              },
+              {
+                id: crypto.randomUUID(),
+                role: 'assistant',
+                content: `⚠️ **API Error Response:**\n\`\`\`json\n${errorContent}\n\`\`\``,
+              },
+            ]);
+          }
+          setFakeLoading(false);
+          return null;
+        }
+        
+        try {
+          // Try to parse JSON response
+          rawResponseData = JSON.parse(rawResponseText);
+        } catch (parseError) {
+          // If not valid JSON, use the raw text
+          rawResponseData = { rawText: rawResponseText, success: false };
+        }
+        
+        // Type the response explicitly with safe defaults
+        const data: ApiChatResponse = {
+          response: rawResponseData?.response || "No response received",
+          thread_id: rawResponseData?.thread_id || crypto.randomUUID(),
+          success: !!rawResponseData?.success,
+          ...rawResponseData
+        };
+        
+        // Add to debug messages regardless of success
+        if (SHOW_RAW_API_RESPONSES) {
+          try {
+            workbenchStore.addDebugMessage({
+              type: data.success ? 'api-response' : 'api-error',
+              content: `API Chat Response: ${JSON.stringify(rawResponseData, null, 2)}`,
+              timestamp: new Date().toISOString()
+            });
+          } catch (debugError) {
+            console.error('Error adding debug message:', debugError);
+          }
+        }
+        
+        // Only log successful responses
+        if (data.success) {
+          logger.info('Received API response:', data);
+        }
+        
+        // Format the response text for better display
+        const formattedResponse = data.response
+          ? data.response.replace(/\n\n/g, '\n').trim()
+          : 'No response content';
+        
+        // Create debug response to show raw API data when enabled
+        const debugResponse = SHOW_RAW_API_RESPONSES 
+          ? `**Response from API:**\n\`\`\`json\n${JSON.stringify(rawResponseData, null, 2)}\n\`\`\`\n\n${formattedResponse}`
+          : formattedResponse;
+        
+        // Update messages with user input and response
+        setMessages([
+          {
+            id: data.thread_id || crypto.randomUUID(),
+            role: 'user',
+            content: message,
+          },
+          {
+            id: `response-${Date.now()}`,
+            role: 'assistant',
+            content: debugResponse,
+          },
+        ]);
+        
+        // Silent success - no toast notification
+        setFakeLoading(false);
+        
+        // Use the thread_id for future WebSocket connections
+        return data.thread_id;
+      } catch (err) {
+        // Show error in UI when debugging is enabled
+        if (SHOW_RAW_API_RESPONSES) {
+          const errorMessage = err instanceof Error ? err.message : 'Unknown error occurred';
+          
+          // Add to debug messages
+          try {
+            workbenchStore.addDebugMessage({
+              type: 'api-error',
+              content: `API Exception: ${errorMessage}`,
+              timestamp: new Date().toISOString()
+            });
+          } catch (debugError) {
+            console.error('Error adding debug message:', debugError);
+          }
+          
+          setMessages([
+            {
+              id: crypto.randomUUID(),
+              role: 'user',
+              content: message,
+            },
+            {
+              id: crypto.randomUUID(),
+              role: 'assistant',
+              content: `⚠️ **Exception Error:**\n\`\`\`\n${errorMessage}\n\`\`\``,
+            },
+          ]);
+        }
+        
+        // Silent error handling
+        setFakeLoading(false);
+        return null;
+      }
+    };
+
     const sendMessage = async (_event: React.UIEvent, messageInput?: string) => {
       const messageContent = messageInput || input;
 
@@ -297,102 +566,21 @@ export const ChatImpl = memo(
       runAnimation();
 
       if (!chatStarted) {
-        setFakeLoading(true);
-
-        if (autoSelectTemplate) {
-          const { template, title } = await selectStarterTemplate({
-            message: messageContent,
-            model,
-            provider,
-          });
-
-          if (template !== 'blank') {
-            const temResp = await getTemplates(template, title).catch((e) => {
-              if (e.message.includes('rate limit')) {
-                toast.warning('Rate limit exceeded. Skipping starter template\n Continuing with blank template');
-              } else {
-                toast.warning('Failed to import starter template\n Continuing with blank template');
-              }
-
-              return null;
-            });
-
-            if (temResp) {
-              const { assistantMessage, userMessage } = temResp;
-              setMessages([
-                {
-                  id: `1-${new Date().getTime()}`,
-                  role: 'user',
-                  content: [
-                    {
-                      type: 'text',
-                      text: `[Model: ${model}]\n\n[Provider: ${provider.name}]\n\n${messageContent}`,
-                    },
-                    ...imageDataList.map((imageData) => ({
-                      type: 'image',
-                      image: imageData,
-                    })),
-                  ] as any,
-                },
-                {
-                  id: `2-${new Date().getTime()}`,
-                  role: 'assistant',
-                  content: assistantMessage,
-                },
-                {
-                  id: `3-${new Date().getTime()}`,
-                  role: 'user',
-                  content: `[Model: ${model}]\n\n[Provider: ${provider.name}]\n\n${userMessage}`,
-                  annotations: ['hidden'],
-                },
-              ]);
-              reload();
-              setInput('');
-              Cookies.remove(PROMPT_COOKIE_KEY);
-
-              setUploadedFiles([]);
-              setImageDataList([]);
-
-              resetEnhancer();
-
-              textareaRef.current?.blur();
-              setFakeLoading(false);
-
-              return;
-            }
-          }
+        try {
+          // For first message, use direct API call
+          await sendDirectApiChatMessage(messageContent);
+          
+          setInput('');
+          Cookies.remove(PROMPT_COOKIE_KEY);
+          setUploadedFiles([]);
+          setImageDataList([]);
+          textareaRef.current?.blur();
+          return;
+        } catch (err) {
+          // If API fails, fallback to the streaming chat
+          logger.error('Failed to use direct API, falling back to streaming:', err);
+          // Continue with normal flow below
         }
-
-        // If autoSelectTemplate is disabled or template selection failed, proceed with normal message
-        setMessages([
-          {
-            id: `${new Date().getTime()}`,
-            role: 'user',
-            content: [
-              {
-                type: 'text',
-                text: `[Model: ${model}]\n\n[Provider: ${provider.name}]\n\n${messageContent}`,
-              },
-              ...imageDataList.map((imageData) => ({
-                type: 'image',
-                image: imageData,
-              })),
-            ] as any,
-          },
-        ]);
-        reload();
-        setFakeLoading(false);
-        setInput('');
-        Cookies.remove(PROMPT_COOKIE_KEY);
-
-        setUploadedFiles([]);
-        setImageDataList([]);
-
-        resetEnhancer();
-
-        textareaRef.current?.blur();
-
-        return;
       }
 
       if (error != null) {
@@ -407,32 +595,16 @@ export const ChatImpl = memo(
         const userUpdateArtifact = filesToArtifacts(modifiedFiles, `${Date.now()}`);
         append({
           role: 'user',
-          content: [
-            {
-              type: 'text',
-              text: `[Model: ${model}]\n\n[Provider: ${provider.name}]\n\n${userUpdateArtifact}${messageContent}`,
-            },
-            ...imageDataList.map((imageData) => ({
-              type: 'image',
-              image: imageData,
-            })),
-          ] as any,
+          content: `${userUpdateArtifact}${messageContent}`,
+          id: crypto.randomUUID(),
         });
 
         workbenchStore.resetAllFileModifications();
       } else {
         append({
           role: 'user',
-          content: [
-            {
-              type: 'text',
-              text: `[Model: ${model}]\n\n[Provider: ${provider.name}]\n\n${messageContent}`,
-            },
-            ...imageDataList.map((imageData) => ({
-              type: 'image',
-              image: imageData,
-            })),
-          ] as any,
+          content: messageContent,
+          id: crypto.randomUUID(),
         });
       }
 
@@ -441,8 +613,6 @@ export const ChatImpl = memo(
 
       setUploadedFiles([]);
       setImageDataList([]);
-
-      resetEnhancer();
 
       textareaRef.current?.blur();
     };
@@ -469,24 +639,6 @@ export const ChatImpl = memo(
 
     const [messageRef, scrollRef] = useSnapScroll();
 
-    useEffect(() => {
-      const storedApiKeys = Cookies.get('apiKeys');
-
-      if (storedApiKeys) {
-        setApiKeys(JSON.parse(storedApiKeys));
-      }
-    }, []);
-
-    const handleModelChange = (newModel: string) => {
-      setModel(newModel);
-      Cookies.set('selectedModel', newModel, { expires: 30 });
-    };
-
-    const handleProviderChange = (newProvider: ProviderInfo) => {
-      setProvider(newProvider);
-      Cookies.set('selectedProvider', newProvider.name, { expires: 30 });
-    };
-
     return (
       <BaseChat
         ref={animationScope}
@@ -498,14 +650,7 @@ export const ChatImpl = memo(
         onStreamingChange={(streaming) => {
           streamingState.set(streaming);
         }}
-        enhancingPrompt={enhancingPrompt}
-        promptEnhanced={promptEnhanced}
         sendMessage={sendMessage}
-        model={model}
-        setModel={handleModelChange}
-        provider={provider}
-        setProvider={handleProviderChange}
-        providerList={activeProviders}
         messageRef={messageRef}
         scrollRef={scrollRef}
         handleInputChange={(e) => {
@@ -526,18 +671,6 @@ export const ChatImpl = memo(
             content: parsedMessages[i] || '',
           };
         })}
-        enhancePrompt={() => {
-          enhancePrompt(
-            input,
-            (input) => {
-              setInput(input);
-              scrollTextArea();
-            },
-            model,
-            provider,
-            apiKeys,
-          );
-        }}
         uploadedFiles={uploadedFiles}
         setUploadedFiles={setUploadedFiles}
         imageDataList={imageDataList}
